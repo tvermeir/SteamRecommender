@@ -226,7 +226,20 @@ def generate_recs_for_single_user(user_idx, user_id_str, user_playtimes_row,
 
         if played_game_id_str not in similar_games_dict:
             continue
+
         similar_data = similar_games_dict[played_game_id_str]
+
+        # Check if similar_data is a dictionary
+        if not isinstance(similar_data, dict):
+            continue
+
+        # Check if the required keys exist
+        if 'similar_games' not in similar_data or 'similarities' not in similar_data:
+            continue
+
+        # Verify both are lists/iterables of the same length
+        if len(similar_data['similar_games']) != len(similar_data['similarities']):
+            continue
 
         for similar_game_id_str, similarity_score in zip(similar_data['similar_games'], similar_data['similarities']):
             similar_game_matrix_idx = game_id_to_matrix_idx_map.get(similar_game_id_str)
@@ -365,7 +378,7 @@ def evaluate_recommender(matrix, user_ids, game_ids, similar_games, output_file,
 
 
 if __name__ == '__main__':
-    client = Client(n_workers=4, threads_per_worker=2, memory_limit='2GB')
+    client = Client(n_workers=2, threads_per_worker=2, memory_limit='3GB')
     print(f"Dask dashboard link: {client.dashboard_link}")
     user_file = 'australian_users_items.json'
     game_file = 'cleaned_steam_games.txt'
