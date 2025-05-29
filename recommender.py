@@ -5,12 +5,10 @@ import json
 import dask
 import dask.bag as db
 from dask.diagnostics import ProgressBar
+from dask.distributed import Client
 
 
-# It's often good practice to use a Dask client, especially for diagnostics or more complex schedulers
-# from dask.distributed import Client
-# client = Client() # Initializes a local Dask cluster (multi-processing by default)
-# print(f"Dask dashboard link: {client.dashboard_link}")
+
 
 def process_user_line(line):
     try:
@@ -71,7 +69,6 @@ def compute_item_similarities(matrix, game_ids_list, output_file, top_n=10):
         log_interval_games = 1
 
     for i in range(num_games):
-        print("hey")
         if (i + 1) % log_interval_games == 0 or (i + 1) == num_games:
             print(f"  Setting up delayed task for game {i + 1}/{num_games} (ID: {game_ids_list[i]})...")
         task = dask.delayed(get_top_n_for_game)(i, game_ids_list[i], similarities_matrix[i], game_ids_list, top_n)
@@ -264,36 +261,56 @@ def generate_recommendations_dask(matrix, user_ids_list, game_ids_list,
     print("Generating personalized recommendations using Dask...")
     start_time = time.time()
 
-    delayed_recommendations = []
+    # Using client.map for better performance
+    from dask.distributed import wait
+
+    # Prepare data chunks
     num_users = len(user_ids_list)
-    print(f"Setting up Dask tasks for {num_users} users...")
-    log_interval_users = 1000  # Log every 1000 users
-    if num_users < log_interval_users * 2:  # if total users is small, log more frequently or every time
-        log_interval_users = 100
-        if num_users < log_interval_users * 2:
-            log_interval_users = 10
+    chunk_size = 100  # Adjust based on your dataset and available memory
 
-    for user_idx, user_id_str in enumerate(user_ids_list):
-        if (user_idx + 1) % log_interval_users == 0 or (user_idx + 1) == num_users:
-            print(f"  Setting up delayed task for user {user_idx + 1}/{num_users} (ID: {user_id_str})...")
+    print(f"Setting up Dask futures for {num_users} users...")
+    futures = []
 
-        user_playtimes_data = matrix[user_idx]
-        task = dask.delayed(generate_recs_for_single_user)(
-            user_idx, user_id_str, user_playtimes_data,
-            game_ids_list, game_id_to_idx_map,
-            similar_games_map, game_details_map,
+    # Scatter large reference data to workers once
+    game_ids_ref = client.scatter(game_ids_list)
+    game_id_to_idx_ref = client.scatter(game_id_to_idx_map)
+    similar_games_ref = client.scatter(similar_games_map)
+    game_details_ref = client.scatter(game_details_map)
+
+    # Create user data chunks
+    for i in range(0, num_users, chunk_size):
+        chunk_end = min(i + chunk_size, num_users)
+        if i % 10 == 0:
+            print(f"Preparing chunk for users {i + 1}-{chunk_end}/{num_users}...")
+        if i % 5000 == 0:
+            print(f"Preparing chunk for users {i + 1}-{chunk_end}/{num_users}...")
+
+        # Create user chunk data
+        user_chunk = []
+        for j in range(i, chunk_end):
+            user_chunk.append((j, user_ids_list[j], matrix[j]))
+
+        # Submit chunk processing task
+        future = client.submit(
+            process_user_chunk,
+            user_chunk,
+            game_ids_ref, game_id_to_idx_ref, similar_games_ref, game_details_ref,
             top_n, min_playtime_threshold
         )
-        delayed_recommendations.append(task)
+        futures.append(future)
 
-    print("Computing recommendations with Dask...")
+    print(f"Submitted {len(futures)} chunks for processing...")
+    print("Computing recommendations with Dask (this may take a while)...")
+
     with ProgressBar():
-        results = dask.compute(*delayed_recommendations)
+        results = client.gather(futures)
 
+    # Process results
     recommendations_dict = {}
-    for user_id_key, rec_data in results:
-        if rec_data:
-            recommendations_dict[user_id_key] = rec_data
+    for chunk_results in results:
+        for user_id, rec_data in chunk_results:
+            if rec_data:
+                recommendations_dict[user_id] = rec_data
 
     print("\nSaving recommendations to JSON file...")
     with open(output_file + '.recommendations.json', 'w') as f:
@@ -303,6 +320,19 @@ def generate_recommendations_dask(matrix, user_ids_list, game_ids_list,
     return recommendations_dict
 
 
+def process_user_chunk(user_chunk, game_ids_list, game_id_to_idx_map,
+                       similar_games_map, game_details_map, top_n, min_playtime_threshold):
+    """Process a chunk of users at once"""
+    results = []
+    for user_idx, user_id_str, user_playtimes in user_chunk:
+        result = generate_recs_for_single_user(
+            user_idx, user_id_str, user_playtimes,
+            game_ids_list, game_id_to_idx_map,
+            similar_games_map, game_details_map,
+            top_n, min_playtime_threshold
+        )
+        results.append(result)
+    return results
 def get_user_recommendations_from_file(user_id_to_find, recommendations_file_path):
     try:
         with open(recommendations_file_path, 'r') as f:
@@ -335,6 +365,8 @@ def evaluate_recommender(matrix, user_ids, game_ids, similar_games, output_file,
 
 
 if __name__ == '__main__':
+    client = Client(n_workers=4, threads_per_worker=2, memory_limit='2GB')
+    print(f"Dask dashboard link: {client.dashboard_link}")
     user_file = 'australian_users_items.json'
     game_file = 'cleaned_steam_games.txt'
     output_file = 'user_game_matrix_dask'
