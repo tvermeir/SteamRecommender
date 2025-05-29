@@ -1,431 +1,530 @@
 import numpy as np
-import ast
+import ast  # For safely evaluating Python literals
 import time
+from collections import defaultdict
 import json
-import dask
-import dask.bag as db
-from dask.diagnostics import ProgressBar
-from dask.distributed import Client
-
-
 
 
 def process_user_line(line):
+    """Process a single user's data line."""
     try:
+        # Strip any whitespace and ensure the line is a complete dictionary
         line = line.strip()
-        if not line:
+        if not line:  # Skip empty lines
             return None
 
+        # Use ast.literal_eval instead of json.loads to handle Python dictionary format
         user_data = ast.literal_eval(line)
         user_id = user_data['user_id']
         items = user_data['items']
+
+        # Create list of (game_id, playtime) tuples
         game_playtimes = []
         for item in items:
-            game_id = item['item_id']  # Assuming item_id is suitable as a direct key
+            game_id = item['item_id']
             playtime = item['playtime_forever']
+            # Apply log(1 + x) transformation
             log_playtime = np.log1p(playtime)
-            game_playtimes.append((str(game_id), log_playtime))  # Ensure game_id is string for consistency
+            game_playtimes.append((game_id, log_playtime))
 
-        return str(user_id), game_playtimes  # Ensure user_id is string
+        return user_id, game_playtimes
     except (ValueError, SyntaxError, KeyError) as e:
-        # print(f"Error processing line: {e}") # Can be very verbose with Dask
-        # print(f"Problematic line: {line[:100]}...")
+        print(f"Error processing line: {e}")
+        print(f"Problematic line: {line[:100]}...")  # Print first 100 chars of problematic line
         return None
 
 
 def compute_cosine_similarity(X):
+    """
+    Compute cosine similarity between all pairs of vectors in X.
+    X should be a 2D array where each row is a vector.
+    """
+    # Calculate norms
     norms = np.linalg.norm(X, axis=1, keepdims=True)
+
+    # Handle zero vectors by setting their norm to 1 (they will have zero similarity with everything)
     norms[norms == 0] = 1
+
+    # Normalize the vectors
     X_norm = X / norms
+
+    # Compute cosine similarity
     return np.dot(X_norm, X_norm.T)
 
 
-# Helper for dask.delayed in compute_item_similarities
-def get_top_n_for_game(game_idx, game_id_str, single_game_similarities_row, all_game_ids_list, top_n_val):
-    # Exclude self (game_idx)
-    # Add 1 to top_n because we might remove self
-    top_indices_with_self = np.argsort(single_game_similarities_row)[::-1][:top_n_val + 1]
-    # Remove self from results
-    top_indices = top_indices_with_self[top_indices_with_self != game_idx][:top_n_val]
+def compute_item_similarities(matrix, game_ids, output_file, top_n=10):
+    """
+    Compute cosine similarity between games and save the results.
 
-    return game_id_str, {
-        'similar_games': [all_game_ids_list[idx] for idx in top_indices],
-        'similarities': [single_game_similarities_row[idx] for idx in top_indices]
-    }
-
-
-def compute_item_similarities(matrix, game_ids_list, output_file, top_n=10):
+    Args:
+        matrix: User-game matrix (users x games)
+        game_ids: List of game IDs corresponding to matrix columns
+        output_file: Base filename for saving results
+        top_n: Number of most similar games to save for each game
+    """
     print("Computing item-item similarities...")
     start_time = time.time()
 
-    similarities_matrix = compute_cosine_similarity(matrix.T)
-    print(f"Raw similarity matrix computed. Shape: {similarities_matrix.shape}")
+    # Compute cosine similarity between game vectors (columns)
+    # Transpose matrix to get games as rows
+    similarities = compute_cosine_similarity(matrix.T)
 
-    similar_games_delayed_tasks = []
-    num_games = len(game_ids_list)
-    print(f"Setting up Dask tasks for top N similar games for {num_games} games...")
-    log_interval_games = 100  # Log every 100 games
-    if num_games < log_interval_games * 2:  # if total games is small, log more frequently or every time
-        log_interval_games = 1
+    # Create a dictionary to store top N similar games for each game
+    similar_games = {}
 
-    for i in range(num_games):
-        if (i + 1) % log_interval_games == 0 or (i + 1) == num_games:
-            print(f"  Setting up delayed task for game {i + 1}/{num_games} (ID: {game_ids_list[i]})...")
-        task = dask.delayed(get_top_n_for_game)(i, game_ids_list[i], similarities_matrix[i], game_ids_list, top_n)
-        similar_games_delayed_tasks.append(task)
+    # For each game, find its top N most similar games
+    for i in range(len(game_ids)):
+        if i % 100 == 0:
+            print(f"Processing game {i}/{len(game_ids)}...")
+        # Get similarities for this game
+        game_similarities = similarities[i]
+        # Get indices of top N similar games (excluding self)
+        # Add 1 to top_n because we'll remove self later
+        top_indices = np.argsort(game_similarities)[::-1][:top_n + 1]
+        # Remove self from results
+        top_indices = top_indices[top_indices != i][:top_n]
+        # Store results
+        similar_games[game_ids[i]] = {
+            'similar_games': [game_ids[idx] for idx in top_indices],
+            'similarities': [game_similarities[idx] for idx in top_indices]
+        }
 
-    print("Computing top N similar games with Dask...")
-    with ProgressBar():
-        results = dask.compute(*similar_games_delayed_tasks)
-
-    similar_games_dict = dict(results)
-
+    # Save results
     print("\nSaving similarity results...")
-    np.save(output_file + '.item_similarities.npy', similarities_matrix)
+    np.save(output_file + '.item_similarities.npy', similarities)
 
+    # Save top N similar games in a more readable format
     with open(output_file + '.top_similar_games.txt', 'w') as f:
-        for game_id, data in similar_games_dict.items():
+        for game_id, data in similar_games.items():
             f.write(f"Game {game_id}:\n")
-            for similar_game, similarity_val in zip(data['similar_games'], data['similarities']):
-                f.write(f"  - {similar_game} (similarity: {similarity_val:.4f})\n")
+            for similar_game, similarity in zip(data['similar_games'], data['similarities']):
+                f.write(f"  - {similar_game} (similarity: {similarity:.4f})\n")
             f.write("\n")
 
     print(f"\nSimilarity computation complete in {time.time() - start_time:.2f} seconds")
-    return similar_games_dict
+    return similar_games
 
 
-def load_game_details_dask(game_file):
-    print(f"Loading game details from {game_file} using Dask Bag...")
-
-    def parse_game_line(line):
-        try:
-            line = line.strip()
-            if not line: return None
-            game_data = ast.literal_eval(line)
-            game_id = game_data.get('id')
-            if game_id is None: return None
-            return str(game_id), game_data  # Ensure game_id is string
-        except (ValueError, SyntaxError, KeyError, AttributeError) as e:
-            # print(f"Error decoding game JSON: {e}, Line: {line[:100]}") # Verbose
-            return None
-
-    bag = db.read_text(game_file, blocksize='64MB').map(parse_game_line).filter(lambda x: x is not None)
-
-    print("Computing game details from Dask Bag...")
-    with ProgressBar():
-        game_details_list = bag.compute()
-
-    game_details_dict = dict(game_details_list)
-    print(f"Loaded details for {len(game_details_dict)} games.")
-    return game_details_dict
-
-
-def build_user_game_matrix(user_file, game_file, output_file):
-    print("Starting matrix construction...")
-    start_time = time.time()
-
-    game_details = load_game_details_dask(game_file)  # Using Dask version
-
-    print("\nFirst pass: collecting users and games using Dask Bag...")
-
-    user_lines_bag = db.read_text(user_file, blocksize='64MB')
-    processed_user_bag = user_lines_bag.map(process_user_line).filter(lambda x: x is not None)
-
-    print("Computing user playtimes from Dask Bag...")
-    with ProgressBar():
-        user_centric_playtimes = processed_user_bag.compute()
-
-    print(f"\nProcessed {len(user_centric_playtimes)} users from file.")
-
-    user_ids_ordered_list = []
-    user_id_to_matrix_idx = {}
-    all_game_ids_set = set()
-    matrix_fill_data = []
-
-    print("Building internal user/game mappings and matrix fill data...")
-    num_processed_users = len(user_centric_playtimes)
-    log_interval_mapping = 10000  # Log every 10000 users during this phase
-    if num_processed_users < log_interval_mapping * 2:
-        log_interval_mapping = 1000  # adjust if fewer users
-        if num_processed_users < log_interval_mapping * 2:
-            log_interval_mapping = 100
-
-    for idx, (user_id_str, game_playtimes_list) in enumerate(user_centric_playtimes):
-        if (idx + 1) % log_interval_mapping == 0 or (idx + 1) == num_processed_users:
-            print(f"  Mapping user {idx + 1}/{num_processed_users}...")
-
-        if user_id_str not in user_id_to_matrix_idx:
-            user_id_to_matrix_idx[user_id_str] = len(user_ids_ordered_list)
-            user_ids_ordered_list.append(user_id_str)
-
-        current_user_idx = user_id_to_matrix_idx[user_id_str]
-
-        for game_id_str, playtime_float in game_playtimes_list:
-            all_game_ids_set.add(game_id_str)
-            matrix_fill_data.append((current_user_idx, game_id_str, playtime_float))
-
-    game_ids_ordered_list = sorted(list(all_game_ids_set))
-    game_id_to_matrix_idx = {gid: i for i, gid in enumerate(game_ids_ordered_list)}
-
-    print(
-        f"\nFirst pass (Dask Bag + local processing) complete. Found {len(user_ids_ordered_list)} users and {len(game_ids_ordered_list)} unique games.")
-
-    print("\nCreating and filling matrix...")
-    matrix = np.zeros((len(user_ids_ordered_list), len(game_ids_ordered_list)), dtype=np.float32)
-
-    fill_count = 0
-    num_matrix_fill_entries = len(matrix_fill_data)
-    log_interval_fill = 100000
-    if num_matrix_fill_entries < log_interval_fill * 2:
-        log_interval_fill = 10000
-
-    for i, (user_idx, game_id_str, playtime_float) in enumerate(matrix_fill_data):
-        game_idx = game_id_to_matrix_idx.get(game_id_str)
-        if game_idx is not None:
-            matrix[user_idx, game_idx] = playtime_float
-            fill_count += 1  # Only count actual fills
-        if (i + 1) % log_interval_fill == 0 or (i + 1) == num_matrix_fill_entries:
-            print(
-                f"  Processed {i + 1}/{num_matrix_fill_entries} potential matrix entries. Actual fills: {fill_count}...")
-
-    print("\nSaving results...")
-    np.save(output_file + '.matrix.npy', matrix)
-    np.save(output_file + '.user_ids.npy', np.array(user_ids_ordered_list, dtype=object))
-    np.save(output_file + '.game_ids.npy', np.array(game_ids_ordered_list, dtype=object))
-
-    print("\nFinal statistics:")
-    print(f"Matrix shape: {matrix.shape}")
-    print(f"Number of non-zero elements: {np.count_nonzero(matrix)}")
-    print(f"Number of users: {len(user_ids_ordered_list)}")
-    print(f"Number of games: {len(game_ids_ordered_list)}")
-
-    similar_games = compute_item_similarities(matrix, game_ids_ordered_list, output_file)
-
-    recommendations = generate_recommendations_dask(matrix, user_ids_ordered_list, game_ids_ordered_list,
-                                                    similar_games, game_details, game_id_to_matrix_idx,
-                                                    output_file)
-
-    print(f"Total processing time for build_user_game_matrix: {time.time() - start_time:.2f} seconds")
-    return matrix, user_ids_ordered_list, game_ids_ordered_list, similar_games, recommendations
-
-
-def generate_recs_for_single_user(user_idx, user_id_str, user_playtimes_row,
-                                  all_game_ids_list,
-                                  game_id_to_matrix_idx_map,
-                                  similar_games_dict, game_details_dict,
-                                  top_n_recs, min_playtime_thresh):
-    played_game_indices = np.where(user_playtimes_row > min_playtime_thresh)[0]
-
-    if len(played_game_indices) == 0:
-        return user_id_str, None
-
-    game_scores = {}
-    for played_game_idx in played_game_indices:
-        played_game_id_str = all_game_ids_list[played_game_idx]
-        playtime = float(user_playtimes_row[played_game_idx])
-
-        if played_game_id_str not in similar_games_dict:
-            continue
-
-        similar_data = similar_games_dict[played_game_id_str]
-
-        # Check if similar_data is a dictionary
-        if not isinstance(similar_data, dict):
-            continue
-
-        # Check if the required keys exist
-        if 'similar_games' not in similar_data or 'similarities' not in similar_data:
-            continue
-
-        # Verify both are lists/iterables of the same length
-        if len(similar_data['similar_games']) != len(similar_data['similarities']):
-            continue
-
-        for similar_game_id_str, similarity_score in zip(similar_data['similar_games'], similar_data['similarities']):
-            similar_game_matrix_idx = game_id_to_matrix_idx_map.get(similar_game_id_str)
-
-            if similar_game_matrix_idx is None:
-                continue
-
-            if user_playtimes_row[similar_game_matrix_idx] > 0:
-                continue
-
-            score = float(similarity_score) * playtime
-            game_scores[similar_game_id_str] = game_scores.get(similar_game_id_str, 0) + score
-
-    if game_scores:
-        top_games_list = sorted(game_scores.items(), key=lambda x: x[1], reverse=True)[:top_n_recs]
-        return user_id_str, {
-            'recommendations': [
-                {
-                    'game_id': game_id_val,
-                    'score': float(score_val),
-                    'details': game_details_dict.get(game_id_val, {})
+def load_game_details(game_file):
+    """
+    Load detailed game information from the game data file.
+    Returns a dictionary mapping game IDs to their details.
+    """
+    print(f"Loading game details from {game_file}...")
+    game_details = {}
+    try:
+        # Read the entire JSON file as a list
+        with open(game_file, 'r') as f:
+            games_list = json.load(f)
+            print(f"Loaded {len(games_list)} games from JSON.")
+            for idx, game_data in enumerate(games_list):
+                if idx == 0:
+                    print("\nFirst game entry:")
+                    print(game_data)
+                game_id = str(game_data.get('id', ''))
+                if not game_id:
+                    print(f"Warning: Entry {idx+1} missing 'id' field")
+                    continue
+                details = {
+                    'name': game_data.get('name', 'Unknown'),
+                    'publisher': game_data.get('publisher', 'Unknown'),
+                    'genres': game_data.get('genres', []),
+                    'price': float(game_data.get('price', 0.0)),
+                    'release_date': game_data.get('release_date', 'Unknown'),
+                    'developer': game_data.get('developer', 'Unknown'),
+                    'tags': game_data.get('tags', []),
+                    'specs': game_data.get('specs', []),
+                    'url': game_data.get('url', 'N/A')
                 }
-                for game_id_val, score_val in top_games_list
-            ]
-        }
-    return user_id_str, None
+                game_details[game_id] = details
+        print(f"\nLoaded details for {len(game_details)} games")
+        if game_details:
+            first_game_id = next(iter(game_details))
+            print("\nFirst game entry (from dict):")
+            print(f"Game ID: {first_game_id}")
+            for key, value in game_details[first_game_id].items():
+                print(f"{key}: {value}")
+        else:
+            print("No game details were loaded!")
+        return game_details
+    except FileNotFoundError:
+        print(f"Error: Game file {game_file} not found!")
+        return {}
+    except Exception as e:
+        print(f"Error loading game details: {str(e)}")
+        return {}
 
 
-def generate_recommendations_dask(matrix, user_ids_list, game_ids_list,
-                                  similar_games_map, game_details_map, game_id_to_idx_map,
-                                  output_file, top_n=10, min_playtime_threshold=0.5):
-    print("Generating personalized recommendations using Dask...")
+def generate_recommendations(matrix, user_ids, game_ids, similar_games, game_details, output_file, top_n=10,
+                             min_playtime_threshold=0.5):
+    """
+    Generate personalized game recommendations for each user.
+
+    Args:
+        matrix: User-game matrix (users x games)
+        user_ids: List of user IDs
+        game_ids: List of game IDs
+        similar_games: Dictionary of similar games for each game
+        game_details: Dictionary of game details
+        output_file: Base filename for saving results
+        top_n: Number of recommendations to generate per user
+        min_playtime_threshold: Minimum normalized playtime to consider a game as "high-playtime"
+    """
+    print("Generating personalized recommendations...")
     start_time = time.time()
 
-    # Using client.map for better performance
-    from dask.distributed import wait
+    # Create a mapping from game_id to index
+    game_id_to_idx = {game_id: idx for idx, game_id in enumerate(game_ids)}
 
-    # Prepare data chunks
-    num_users = len(user_ids_list)
-    chunk_size = 100  # Adjust based on your dataset and available memory
+    # For each user, generate recommendations
+    recommendations = {}
 
-    print(f"Setting up Dask futures for {num_users} users...")
-    futures = []
+    for user_idx, user_id in enumerate(user_ids):
+        if user_idx % 1000 == 0:
+            print(f"Processing user {user_idx}/{len(user_ids)}...")
 
-    # Scatter large reference data to workers once
-    game_ids_ref = client.scatter(game_ids_list)
-    game_id_to_idx_ref = client.scatter(game_id_to_idx_map)
-    similar_games_ref = client.scatter(similar_games_map)
-    game_details_ref = client.scatter(game_details_map)
+        # Get user's playtime vector
+        user_playtimes = matrix[user_idx]
 
-    # Create user data chunks
-    for i in range(0, num_users, chunk_size):
-        chunk_end = min(i + chunk_size, num_users)
-        if i % 10 == 0:
-            print(f"Preparing chunk for users {i + 1}-{chunk_end}/{num_users}...")
-        if i % 5000 == 0:
-            print(f"Preparing chunk for users {i + 1}-{chunk_end}/{num_users}...")
+        # Find games the user has played significantly
+        played_games = np.where(user_playtimes > min_playtime_threshold)[0]
 
-        # Create user chunk data
-        user_chunk = []
-        for j in range(i, chunk_end):
-            user_chunk.append((j, user_ids_list[j], matrix[j]))
+        if len(played_games) == 0:
+            continue
 
-        # Submit chunk processing task
-        future = client.submit(
-            process_user_chunk,
-            user_chunk,
-            game_ids_ref, game_id_to_idx_ref, similar_games_ref, game_details_ref,
-            top_n, min_playtime_threshold
-        )
-        futures.append(future)
+        # Calculate recommendation scores for each unplayed game
+        game_scores = {}
+        for played_game_idx in played_games:
+            played_game_id = game_ids[played_game_idx]
+            playtime = user_playtimes[played_game_idx]
+            # Get similar games for this played game
+            similar_data = similar_games[played_game_id]
 
-    print(f"Submitted {len(futures)} chunks for processing...")
-    print("Computing recommendations with Dask (this may take a while)...")
+            # Add weighted scores for each similar game
+            for similar_game_id, similarity in zip(similar_data['similar_games'], similar_data['similarities']):
+                similar_game_idx = game_id_to_idx[similar_game_id]
+                # Skip if user has already played this game
+                if user_playtimes[similar_game_idx] > 0:
+                    continue
+                # Score = similarity * playtime
+                score = similarity * playtime
+                if similar_game_id in game_scores:
+                    game_scores[similar_game_id] += score
+                else:
+                    game_scores[similar_game_id] = score
 
-    with ProgressBar():
-        results = client.gather(futures)
+        # Sort games by score and get top N
+        if game_scores:
+            top_games = sorted(game_scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
 
-    # Process results
-    recommendations_dict = {}
-    for chunk_results in results:
-        for user_id, rec_data in chunk_results:
-            if rec_data:
-                recommendations_dict[user_id] = rec_data
+            recommended_games_details = []
+            for game_id_val, score_val in top_games:
+                details = game_details.get(str(game_id_val), {}) # Ensure game_id is string for lookup
+                game_info = {
+                    'game_id': str(game_id_val),
+                    'score': float(score_val),
+                    'title': details.get('name', 'N/A'), # 'name' is used as title in load_game_details
+                    'price': details.get('price', 0.0),
+                    'publisher': details.get('publisher', 'N/A'),
+                    'genres': details.get('genres', []),
+                    'url': details.get('url', 'N/A') # Assuming 'url' key exists in details
+                }
+                recommended_games_details.append(game_info)
 
-    print("\nSaving recommendations to JSON file...")
-    with open(output_file + '.recommendations.json', 'w') as f:
-        json.dump(recommendations_dict, f, indent=4)
+            recommendations[user_id] = {
+                'recommended_games': recommended_games_details
+            }
+
+    # Save recommendations in a readable format
+    print("\nSaving recommendations...")
+
+    # Save recommendations to a JSON file
+    recommendations_json_file = output_file + '.recommendations.json'
+    try:
+        with open(recommendations_json_file, 'w') as f_json:
+            json.dump(recommendations, f_json, indent=4)
+        print(f"Recommendations saved to {recommendations_json_file}")
+    except IOError as e:
+        print(f"Error saving recommendations to JSON file {recommendations_json_file}: {e}")
+    except TypeError as e:
+        print(f"Error serializing recommendations to JSON: {e}")
 
     print(f"\nRecommendation generation complete in {time.time() - start_time:.2f} seconds")
-    return recommendations_dict
-
-
-def process_user_chunk(user_chunk, game_ids_list, game_id_to_idx_map,
-                       similar_games_map, game_details_map, top_n, min_playtime_threshold):
-    """Process a chunk of users at once"""
-    results = []
-    for user_idx, user_id_str, user_playtimes in user_chunk:
-        result = generate_recs_for_single_user(
-            user_idx, user_id_str, user_playtimes,
-            game_ids_list, game_id_to_idx_map,
-            similar_games_map, game_details_map,
-            top_n, min_playtime_threshold
-        )
-        results.append(result)
-    return results
-def get_user_recommendations_from_file(user_id_to_find, recommendations_file_path):
-    try:
-        with open(recommendations_file_path, 'r') as f:
-            all_recommendations = json.load(f)
-        user_id_key = str(user_id_to_find)
-        if user_id_key in all_recommendations:
-            return all_recommendations[user_id_key]
-        else:
-            print(f"User ID '{user_id_key}' not found in the recommendations file.")
-            return None
-    except FileNotFoundError:
-        print(f"Error: Recommendations file not found at '{recommendations_file_path}'.")
-        return None
-    except json.JSONDecodeError:
-        print(f"Error: Could not decode JSON from '{recommendations_file_path}'.")
-        return None
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        return None
+    return recommendations
 
 
 def evaluate_recommender(matrix, user_ids, game_ids, similar_games, output_file, top_n=10, min_playtime_threshold=0.5,
                          test_fraction=0.1):
+    """
+    Evaluate the recommender system using leave-one-out validation.
+    """
     print("\n=== Starting Recommender System Evaluation ===")
-    hit_rate, mean_rank, coverage_rate = 0.0, float('inf'), 0.0
-    start_time_eval = time.time()
-    print("\n=== Evaluation Results ===")
-    print(f"Evaluation complete in {time.time() - start_time_eval:.2f} seconds")
-    return hit_rate, mean_rank, coverage_rate
+    print(f"Parameters:")
+    print(f"- Top N recommendations: {top_n}")
+    print(f"- Minimum playtime threshold: {min_playtime_threshold}")
+    print(f"- Test fraction: {test_fraction}")
+    start_time = time.time()
 
+    # Create a mapping from game_id to index
+    game_id_to_idx = {game_id: idx for idx, game_id in enumerate(game_ids)}
+
+    # Select random users for testing
+    np.random.seed(42)  # For reproducibility
+    test_user_indices = np.random.choice(len(user_ids), size=int(len(user_ids) * test_fraction), replace=False)
+    print(f"\nSelected {len(test_user_indices)} users for testing")
+
+    # Pre-compute played games for all test users
+    print("Pre-computing played games...")
+    played_games_mask = matrix[test_user_indices] > min_playtime_threshold
+    valid_users = np.where(np.sum(played_games_mask, axis=1) >= 2)[0]
+    test_user_indices = test_user_indices[valid_users]
+    print(f"Found {len(test_user_indices)} valid users with sufficient games")
+
+    # Pre-compute similarity matrix for all games
+    print("Pre-computing similarity matrix...")
+    similarity_matrix = np.zeros((len(game_ids), len(game_ids)))
+    for i, game_id in enumerate(game_ids):
+        similar_data = similar_games[game_id]
+        for similar_id, similarity in zip(similar_data['similar_games'], similar_data['similarities']):
+            j = game_id_to_idx[similar_id]
+            similarity_matrix[i, j] = similarity
+
+    # Metrics to track
+    hit_rates = []
+    ranks = []
+    coverage = []
+    successful_hits = 0
+    total_attempts = 0
+    skipped_users = 0
+
+    # Process users in batches
+    batch_size = 100
+    for batch_start in range(0, len(test_user_indices), batch_size):
+        batch_end = min(batch_start + batch_size, len(test_user_indices))
+        batch_indices = test_user_indices[batch_start:batch_end]
+        print(f"\nProcessing users {batch_start + 1}-{batch_end} of {len(test_user_indices)}...")
+
+        # Get playtime vectors for the batch
+        batch_playtimes = matrix[batch_indices]
+        for i, user_idx in enumerate(batch_indices):
+            user_id = user_ids[user_idx]
+            user_playtimes = batch_playtimes[i]
+
+            # Find games the user has played significantly
+            played_games_indices = np.where(user_playtimes > min_playtime_threshold)[0]
+
+            if len(played_games_indices) < 2:
+                skipped_users += 1
+                continue
+
+            # Randomly select one game to hide
+            hidden_game_idx = np.random.choice(played_games_indices)
+            # hidden_game_id = game_ids[hidden_game_idx] # Not directly used later for rank check by ID
+
+            # Create a modified user playtime vector with the hidden game removed for score calculation
+            temp_user_playtimes = user_playtimes.copy()
+            temp_user_playtimes[hidden_game_idx] = 0 # Effectively hide this game for score calculation
+
+            # Calculate recommendation scores
+            current_played_games_for_scoring = np.where(temp_user_playtimes > min_playtime_threshold)[0]
+
+            game_scores = defaultdict(float)
+            for played_game_idx_for_scoring in current_played_games_for_scoring:
+                # played_game_id_for_scoring = game_ids[played_game_idx_for_scoring] # Not needed
+                playtime_for_scoring = temp_user_playtimes[played_game_idx_for_scoring]
+
+                # Check if played_game_id_for_scoring is in similar_games
+                pg_id_str = game_ids[played_game_idx_for_scoring] # Use the actual ID string for dict lookup
+                if pg_id_str not in similar_games:
+                    continue
+
+                similar_data = similar_games[pg_id_str]
+
+                for sim_game_id, sim_score in zip(similar_data['similar_games'], similar_data['similarities']):
+                    sim_game_idx = game_id_to_idx[sim_game_id]
+                    if temp_user_playtimes[sim_game_idx] == 0: # If not played (or is the hidden one)
+                        game_scores[sim_game_idx] += sim_score * playtime_for_scoring
+
+            # Get top N recommendations (indices)
+            # Ensure items are sorted by score, then by game index for tie-breaking (optional but good practice)
+            sorted_recommended_indices = sorted(game_scores.keys(), key=lambda k: game_scores[k], reverse=True)
+            top_n_recommended_indices = sorted_recommended_indices[:top_n]
+
+            # Check if hidden game is in recommendations
+            if hidden_game_idx in top_n_recommended_indices:
+                try:
+                    rank = top_n_recommended_indices.index(hidden_game_idx) + 1
+                    hit_rates.append(1)
+                    ranks.append(rank)
+                    successful_hits +=1
+                except ValueError: # Should not happen if it's in the list
+                    pass
+            else:
+                hit_rates.append(0)
+                # If you want to record rank even if not in top_N, find its rank in sorted_recommended_indices
+                try:
+                    full_rank = sorted_recommended_indices.index(hidden_game_idx) + 1
+                    ranks.append(full_rank)
+                except ValueError: # Hidden game was not recommended at all
+                    ranks.append(float('inf')) # Or some large number / specific indicator
+
+
+            # Coverage: what fraction of items that could be recommended were ever recommended
+            # This is a simpler interpretation of coverage: fraction of test items that appeared in any top-N list
+            # For a more standard item coverage, you'd collect all unique recommended items across all test users.
+            # Here, we just check if we could make a recommendation for this user.
+            if top_n_recommended_indices: # If any recommendations were made
+                 coverage.append(1)
+            else:
+                 coverage.append(0)
+            total_attempts += 1
+
+    # Calculate metrics
+    hit_rate_metric = np.mean(hit_rates) if hit_rates else 0
+    mean_rank_metric = np.mean([r for r in ranks if r != float('inf')]) if ranks and any(r != float('inf') for r in ranks) else float('inf')
+    # Catalog coverage: percentage of items in the catalog that were recommended at least once.
+    # This requires collecting all unique game_ids from all recommendations.
+    # For simplicity, the current 'coverage' list is more like "recommendation opportunity coverage"
+    coverage_rate_metric = np.mean(coverage) if coverage else 0
+
+
+    # Save evaluation results
+    print("\n=== Evaluation Results ===")
+    evaluation_results_file = output_file + '.evaluation.txt'
+    try:
+        with open(evaluation_results_file, 'w') as f:
+            f.write("Recommender System Evaluation Results:\n")
+            f.write("=====================================\n\n")
+            f.write("Parameters:\n")
+            f.write(f"- Top N recommendations: {top_n}\n")
+            f.write(f"- Minimum playtime threshold: {min_playtime_threshold}\n")
+            f.write(f"- Test fraction: {test_fraction}\n\n")
+            f.write("Test Statistics:\n")
+            f.write(f"- Total initial test users: {len(np.random.choice(len(user_ids), size=int(len(user_ids) * test_fraction), replace=False))}\n")
+            f.write(f"- Valid test users (>=2 played games): {len(test_user_indices)}\n")
+            f.write(f"- Skipped users (insufficient games for hide-one): {skipped_users}\n")
+            f.write(f"- Total recommendation attempts (for valid users): {total_attempts}\n")
+            f.write(f"- Successful hits (hidden game in top N): {successful_hits}\n\n")
+            f.write("Performance Metrics:\n")
+            f.write(f"- Hit Rate (games found in top {top_n}): {hit_rate_metric:.4f}\n")
+            f.write(f"- Mean Rank of Hidden Games (when found): {mean_rank_metric:.2f}\n")
+            f.write(f"- Recommendation Opportunity Coverage: {coverage_rate_metric:.4f}\n") # Clarified metric name
+            f.write(f"- Total evaluation time: {time.time() - start_time:.2f} seconds\n")
+        print(f"Results saved to {evaluation_results_file}")
+    except IOError as e:
+        print(f"Error saving evaluation results to {evaluation_results_file}: {e}")
+
+
+    print(f"Evaluation complete in {time.time() - start_time:.2f} seconds")
+    return hit_rate_metric, mean_rank_metric, coverage_rate_metric
+
+
+def build_user_game_matrix(user_file, game_file, output_file):
+    """Build user-game matrix from user data."""
+    print("Starting matrix construction...")
+    start_time = time.time()
+
+    # Load game details
+    game_details = load_game_details(game_file)
+
+    # First pass: collect all users and games
+    print("First pass: collecting users and games...")
+    user_ids_list = [] # Renamed to avoid conflict with game_ids set
+    game_ids_set = set() # Renamed for clarity
+    user_games_data = []  # List to store (user_idx, game_id_str, playtime_float) tuples
+
+    line_count = 0
+    try:
+        with open(user_file, 'r') as f:
+            for line in f:
+                line_count += 1
+                if line_count % 10000 == 0: # Increased log frequency
+                    print(f"Processed {line_count} user lines...")
+
+                result = process_user_line(line)
+                if result is None:
+                    continue
+
+                user_id_str, games_playtimes_list = result
+
+                # Ensure user_id_str is added to user_ids_list only once and get its index
+                try:
+                    current_user_idx = user_ids_list.index(user_id_str)
+                except ValueError:
+                    user_ids_list.append(user_id_str)
+                    current_user_idx = len(user_ids_list) - 1
+
+                for game_id_str, playtime_float in games_playtimes_list:
+                    game_ids_set.add(str(game_id_str)) # Ensure game_id is string
+                    user_games_data.append((current_user_idx, str(game_id_str), playtime_float))
+    except FileNotFoundError:
+        print(f"Error: User file {user_file} not found!")
+        return None, None, None, None, None # Indicate failure
+    except Exception as e:
+        print(f"An error occurred during user file processing: {e}")
+        return None, None, None, None, None # Indicate failure
+
+
+    print(f"\nFirst pass complete. Found {len(user_ids_list)} users and {len(game_ids_set)} unique games.")
+
+    # Convert game_ids_set to sorted list and create mapping
+    print("\nCreating game ID mapping...")
+    game_ids_ordered_list = sorted(list(game_ids_set))
+    game_id_to_idx_map = {game_id: idx for idx, game_id in enumerate(game_ids_ordered_list)}
+
+    # Create matrix
+    print("\nCreating and filling matrix...")
+    matrix = np.zeros((len(user_ids_list), len(game_ids_ordered_list)), dtype=np.float32)
+
+    # Fill matrix
+    fill_count = 0
+    for i, (user_idx, game_id_str, playtime_float) in enumerate(user_games_data):
+        if i % 1000000 == 0: # Increased log frequency
+            print(f"Filled {fill_count} of {len(user_games_data)} entries into matrix...")
+
+        game_idx = game_id_to_idx_map.get(game_id_str) # Use .get for safety, though all should be present
+        if game_idx is not None:
+            matrix[user_idx, game_idx] = playtime_float
+            fill_count +=1
+
+    print(f"Matrix filling complete. {fill_count} entries filled.")
+
+    # Save matrix and mappings
+    print("\nSaving results...")
+    try:
+        np.save(output_file + '.matrix.npy', matrix)
+        np.save(output_file + '.user_ids.npy', np.array(user_ids_list, dtype=object)) # Save as object array for strings
+        np.save(output_file + '.game_ids.npy', np.array(game_ids_ordered_list, dtype=object))
+    except IOError as e:
+        print(f"Error saving matrix or ID files: {e}")
+        # Decide if to proceed or return failure
+
+    # Print statistics
+    print("\nFinal statistics:")
+    print(f"Matrix shape: {matrix.shape}")
+    print(f"Number of non-zero elements: {np.count_nonzero(matrix)}")
+    print(f"Number of users: {len(user_ids_list)}")
+    print(f"Number of games: {len(game_ids_ordered_list)}")
+
+    total_time_matrix = time.time() - start_time
+    print(f"Matrix construction time: {total_time_matrix:.2f} seconds")
+
+    # Compute and save item similarities
+    similar_games = compute_item_similarities(matrix, game_ids_ordered_list, output_file)
+
+    # Generate and save recommendations
+    recommendations = generate_recommendations(matrix, user_ids_list, game_ids_ordered_list, similar_games, game_details, output_file)
+
+    # Evaluate the recommender system
+    # Ensure all inputs to evaluate_recommender are correct
+    hit_rate, mean_rank, coverage = evaluate_recommender(matrix, user_ids_list, game_ids_ordered_list, similar_games, output_file)
+
+    print(f"Total processing time for build_user_game_matrix: {time.time() - start_time:.2f} seconds")
+    return matrix, user_ids_list, game_ids_ordered_list, similar_games, recommendations
 
 if __name__ == '__main__':
-    client = Client(n_workers=2, threads_per_worker=2, memory_limit='3GB')
-    print(f"Dask dashboard link: {client.dashboard_link}")
     user_file = 'australian_users_items.json'
-    game_file = 'cleaned_steam_games.txt'
-    output_file = 'user_game_matrix_dask'
-    recommendations_file = output_file + '.recommendations.json'
+    game_file = 'cleaned_steam_games.json'  # Using the cleaned file instead
+    output_file = 'user_game_matrix'
+    build_user_game_matrix(user_file, game_file, output_file)
 
-    # To build the matrix and recommendations (run once, or if data changes):
-    # print("Building matrix and generating recommendations for the first time...")
-    # build_user_game_matrix(user_file, game_file, output_file)
-    # print("\nBuild and recommendation process complete.")
-    # print(f"Recommendation file generated at: {recommendations_file}")
-
-    try:
-        with open(recommendations_file, 'r') as f:
-            pass
-        print(f"\nFound recommendations file: {recommendations_file}")
-    except FileNotFoundError:
-        print(f"Recommendations file {recommendations_file} not found!")
-        print("Attempting to build it now...")
-        build_user_game_matrix(user_file, game_file, output_file)
-        print("\nBuild and recommendation process complete.")
-
-    while True:
-        print("\n--- Game Recommendation Search ---")
-        target_user_id_input = input("Enter your User ID to get recommendations (or type 'quit' to exit): ").strip()
-
-        if target_user_id_input.lower() == 'quit':
-            print("Exiting recommendation search.")
-            break
-        if not target_user_id_input:
-            print("User ID cannot be empty. Please try again.")
-            continue
-
-        print(f"\nFetching recommendations for user: {target_user_id_input}...")
-        user_recs = get_user_recommendations_from_file(target_user_id_input, recommendations_file)
-
-        if user_recs and user_recs.get('recommendations'):
-            print(f"Top game recommendations for {target_user_id_input}:")
-            recommendations_list = user_recs['recommendations']
-            for i, rec in enumerate(recommendations_list, 1):
-                game_id = rec.get('game_id')
-                score = rec.get('score')
-                details = rec.get('details', {})
-                game_title = details.get('title', details.get('app_name', 'N/A'))
-                print(f"  {i}. Game ID: {game_id}, Title: {game_title}, Score: {score:.4f}")
-        elif user_recs and not user_recs.get('recommendations'):
-            print(
-                f"User {target_user_id_input} was processed, but no recommendations could be generated (e.g., played too few games or no similar unplayed games).")
-        else:
-            pass
