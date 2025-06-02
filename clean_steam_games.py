@@ -5,9 +5,9 @@ import json
 def clean_string(s):
     if not isinstance(s, str):
         return str(s)
-    # Remove any non-printable characters
+    
     s = ''.join(c for c in s if c.isprintable())
-    # Remove extra whitespace
+   
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
@@ -17,7 +17,7 @@ def clean_price(price):
     if isinstance(price, str):
         if price.lower() in ['free to play', 'free']:
             return 0.0
-        # Try to extract numeric value from string
+    
         match = re.search(r'\d+\.?\d*', price)
         if match:
             return float(match.group())
@@ -31,10 +31,10 @@ def clean_game_data(input_file, output_file):
         for line in f:
             total_games += 1
             try:
-                # Convert Python-style string to dictionary
+               
                 game = ast.literal_eval(line.strip())
 
-                # Create cleaned game dictionary with consistent fields
+               
                 cleaned_game = {
                     'id': game.get('id', ''),
                     'name': clean_string(game.get('app_name', '')),
@@ -53,7 +53,7 @@ def clean_game_data(input_file, output_file):
                     'sentiment': game.get('sentiment', '')
                 }
 
-                # Only write games that have at least an ID and name
+                
                 if cleaned_game['id'] and cleaned_game['name']:
                     cleaned_games.append(cleaned_game)
                     processed_games += 1
